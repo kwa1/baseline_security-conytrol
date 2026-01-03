@@ -1,0 +1,83 @@
+name: SBOM & Vulnerability Gates (v1.2.0)
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]] || [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=nonprod" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: app:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+
+      - uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Generate SBOM
+        run: |
+          trivy image --format cyclonedx \
+            --output sbom.json app:${{ github.sha }}
+
+      - name: SBOM vulnerability scan
+        run: |
+          trivy sbom sbom.json --format json \
+            --output vuln-report.json \
+            --severity CRITICAL,HIGH
+
+      - name: MITRE analysis
+        run: |
+          python3 scripts/mitre_analyzer.py \
+            --input vuln-report.json \
+            --output mitre-analysis.json \
+            --environment ${{ steps.env.outputs.environment }}
+
+      - name: OPA policy enforcement
+        run: |
+          conftest test vuln-report.json \
+            --policy policy/ \
+            --data exceptions/ \
+            --input environment=${{ steps.env.outputs.environment }}
+
+          conftest test sbom.json --policy policy/
+          conftest test mitre-analysis.json --policy policy/
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            sbom.json
+            vuln-report.json
+            mitre-analysis.json
+            trivy.sarif
