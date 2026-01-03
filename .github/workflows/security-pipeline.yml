@@ -1,11 +1,10 @@
-name: Reusable SBOM & Vulnerability Gates
+name: Reusable SBOM & Vulnerability Gates (Production-Grade)
 
-# Reusable workflow definition
 on:
   workflow_call:
     inputs:
       environment:
-        required: true
+        required: false
         type: string
       image_name:
         required: true
@@ -29,36 +28,62 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set environment variables
-        id: env
+      - name: Determine environment
+        id: set-env
         run: |
-          echo "ENVIRONMENT=${{ inputs.environment }}" >> $GITHUB_ENV
-          echo "IMAGE_NAME=${{ inputs.image_name }}" >> $GITHUB_ENV
+          if [[ -n "${{ inputs.environment }}" ]]; then
+            echo "ENVIRONMENT=${{ inputs.environment }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" ]] || [[ "${GITHUB_REF}" =~ refs/tags/v.* ]]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == "refs/heads/develop" ]]; then
+            echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+          fi
+          echo "Determined environment: $ENVIRONMENT"
 
-      - name: Set severity thresholds by environment
+      - name: Set severity thresholds
         id: thresholds
         run: |
-          if [[ "${ENVIRONMENT}" == "prod" ]]; then
-            echo "ALLOWED_SEVERITY=LOW,MEDIUM" >> $GITHUB_ENV
-            echo "DENY_SEVERITY=HIGH,CRITICAL" >> $GITHUB_ENV
-          elif [[ "${ENVIRONMENT}" == "staging" ]]; then
-            echo "ALLOWED_SEVERITY=LOW,MEDIUM,HIGH" >> $GITHUB_ENV
-            echo "DENY_SEVERITY=CRITICAL" >> $GITHUB_ENV
-          else
-            # dev or nonprod
-            echo "ALLOWED_SEVERITY=ALL" >> $GITHUB_ENV
-            echo "DENY_SEVERITY=" >> $GITHUB_ENV
-          fi
+          case "$ENVIRONMENT" in
+            prod)
+              echo "ALLOWED_SEVERITY=LOW,MEDIUM" >> $GITHUB_ENV
+              echo "DENY_SEVERITY=HIGH,CRITICAL" >> $GITHUB_ENV
+              ;;
+            staging)
+              echo "ALLOWED_SEVERITY=LOW,MEDIUM,HIGH" >> $GITHUB_ENV
+              echo "DENY_SEVERITY=CRITICAL" >> $GITHUB_ENV
+              ;;
+            dev|*)
+              echo "ALLOWED_SEVERITY=ALL" >> $GITHUB_ENV
+              echo "DENY_SEVERITY=" >> $GITHUB_ENV
+              ;;
+          esac
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
       - name: Build Docker image
-        run: docker build -t "${IMAGE_NAME}:${GITHUB_SHA}" .
+        run: |
+          docker build --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new \
+            -t "${{ inputs.image_name }}:${GITHUB_SHA}" .
+
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: "${IMAGE_NAME}:${GITHUB_SHA}"
+          image-ref: "${{ inputs.image_name }}:${GITHUB_SHA}"
           format: sarif
           output: trivy.sarif
           severity: CRITICAL,HIGH,MEDIUM,LOW
@@ -71,7 +96,7 @@ jobs:
       - name: Generate SBOM (CycloneDX)
         run: |
           trivy image --format cyclonedx \
-            --output sbom.json "${IMAGE_NAME}:${GITHUB_SHA}"
+            --output sbom.json "${{ inputs.image_name }}:${GITHUB_SHA}"
 
       - name: SBOM vulnerability scan
         run: |
@@ -87,16 +112,16 @@ jobs:
             --environment "${ENVIRONMENT}"
 
       - name: OPA policy enforcement
+        id: opa
         run: |
-          # Enforce environment-aware gates
           conftest test vuln-report.json \
             --policy policy/ \
             --data exceptions/ \
             --set deny_severity="${DENY_SEVERITY}" \
-            --set allowed_severity="${ALLOWED_SEVERITY}"
+            --set allowed_severity="${ALLOWED_SEVERITY}" || exit 1
 
-          conftest test sbom.json --policy policy/
-          conftest test mitre-analysis.json --policy policy/
+          conftest test sbom.json --policy policy/ || exit 1
+          conftest test mitre-analysis.json --policy policy/ || exit 1
 
       - name: Compliance annotations (SLSA/NIST/ISO)
         run: |
@@ -115,3 +140,11 @@ jobs:
             mitre-analysis.json
             trivy.sarif
             compliance-report.json
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: rtCamp/action-slack-notify@v2
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          message: "Security gates failed in $ENVIRONMENT for image ${{ inputs.image_name }}:${GITHUB_SHA}"
+          color: danger
