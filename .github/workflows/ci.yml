@@ -1,0 +1,20 @@
+name: CI - SBOM & Vulnerability Gates
+
+on:
+  push:
+    branches: ["main", "develop", "feature/*"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main", "develop"]
+
+jobs:
+  security-check:
+    uses: <your-org/security-workflows>/.github/workflows/security-pipeline.yml@v1.2.0
+    with:
+      # Set environment dynamically
+      environment: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') && 'prod' || github.ref == 'refs/heads/develop' && 'staging' || 'dev' }}
+      image_name: myapp
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
