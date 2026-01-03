@@ -1,0 +1,59 @@
+# =========================
+# Stage 1: Builder
+# =========================
+FROM python:3.12-slim AS builder
+
+# Security: Prevents Python from writing .pyc files
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install build dependencies only if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency manifests first (better caching)
+COPY requirements.txt .
+
+# Install dependencies into a virtual environment
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip && \
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# =========================
+# Stage 2: Runtime
+# =========================
+FROM python:3.12-slim
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Runtime environment variables
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy application code
+COPY app/ app/
+COPY scripts/ scripts/
+
+# Ownership hardening
+RUN chown -R appuser:appuser /app /opt/venv
+
+# Drop privileges
+USER appuser
+
+# Healthcheck (important for prod)
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD python -c "import sys; sys.exit(0)"
+
+# Default command
+CMD ["python", "app/main.py"]
