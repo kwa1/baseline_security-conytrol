@@ -1,4 +1,4 @@
-name: Reusable SBOM & Vulnerability Gates (Production-Grade)
+name: Reusable SBOM & Vulnerability Gates for all projects & Env
 
 on:
   workflow_call:
@@ -15,6 +15,10 @@ on:
       REGISTRY_PASSWORD:
         required: true
       SLACK_WEBHOOK_URL:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
         required: true
 
 jobs:
@@ -76,7 +80,6 @@ jobs:
             --cache-from type=local,src=/tmp/.buildx-cache \
             --cache-to type=local,dest=/tmp/.buildx-cache-new \
             -t "${{ inputs.image_name }}:${GITHUB_SHA}" .
-
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
@@ -119,7 +122,6 @@ jobs:
             --data exceptions/ \
             --set deny_severity="${DENY_SEVERITY}" \
             --set allowed_severity="${ALLOWED_SEVERITY}" || exit 1
-
           conftest test sbom.json --policy policy/ || exit 1
           conftest test mitre-analysis.json --policy policy/ || exit 1
 
@@ -140,6 +142,30 @@ jobs:
             mitre-analysis.json
             trivy.sarif
             compliance-report.json
+
+      - name: Archive security artifacts to S3
+        if: ${{ always() }}
+        env:
+          S3_BUCKET: my-enterprise-sbom-bucket
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          for file in sbom.json vuln-report.json mitre-analysis.json compliance-report.json trivy.sarif; do
+            if [ -f "$file" ]; then
+              aws s3 cp "$file" "s3://${S3_BUCKET}/${GITHUB_REPOSITORY}/${GITHUB_SHA}/$file"
+            fi
+          done
+
+      - name: Push metrics to CloudWatch
+        run: |
+          python3 scripts/cloudwatch_metrics.py \
+            --vuln-report vuln-report.json \
+            --mitre-report mitre-analysis.json
+        env:
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Notify Slack on failure
         if: failure()
