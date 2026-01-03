@@ -1,0 +1,5 @@
+exceptions:
+  - vulnerability_id: CVE-2024-12345
+    justification: "Upstream fix pending"
+    approved_by: security-team
+    expires_at: 1735689600000000000  # 2024-12-31 in ns
