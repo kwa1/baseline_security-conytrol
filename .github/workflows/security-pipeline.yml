@@ -1,76 +1,109 @@
-name: SBOM & Vulnerability Gates (v1.2.0)
+name: Reusable SBOM & Vulnerability Gates
 
+# Reusable workflow definition
 on:
-  pull_request:
-    branches: ["main"]
-  push:
-    branches: ["main"]
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image_name:
+        required: true
+        type: string
+    secrets:
+      REGISTRY_USERNAME:
+        required: true
+      REGISTRY_PASSWORD:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
 
 jobs:
   security:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
       security-events: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Determine environment
+      - name: Set environment variables
         id: env
         run: |
-          if [[ "${GITHUB_REF}" == "refs/heads/main" ]] || [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "environment=production" >> $GITHUB_OUTPUT
+          echo "ENVIRONMENT=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ inputs.image_name }}" >> $GITHUB_ENV
+
+      - name: Set severity thresholds by environment
+        id: thresholds
+        run: |
+          if [[ "${ENVIRONMENT}" == "prod" ]]; then
+            echo "ALLOWED_SEVERITY=LOW,MEDIUM" >> $GITHUB_ENV
+            echo "DENY_SEVERITY=HIGH,CRITICAL" >> $GITHUB_ENV
+          elif [[ "${ENVIRONMENT}" == "staging" ]]; then
+            echo "ALLOWED_SEVERITY=LOW,MEDIUM,HIGH" >> $GITHUB_ENV
+            echo "DENY_SEVERITY=CRITICAL" >> $GITHUB_ENV
           else
-            echo "environment=nonprod" >> $GITHUB_OUTPUT
+            # dev or nonprod
+            echo "ALLOWED_SEVERITY=ALL" >> $GITHUB_ENV
+            echo "DENY_SEVERITY=" >> $GITHUB_ENV
           fi
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        run: docker build -t app:${{ github.sha }} .
+      - name: Build Docker image
+        run: docker build -t "${IMAGE_NAME}:${GITHUB_SHA}" .
 
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: app:${{ github.sha }}
+          image-ref: "${IMAGE_NAME}:${GITHUB_SHA}"
           format: sarif
           output: trivy.sarif
-          severity: CRITICAL,HIGH
+          severity: CRITICAL,HIGH,MEDIUM,LOW
 
-      - uses: github/codeql-action/upload-sarif@v2
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v2
         with:
           sarif_file: trivy.sarif
 
-      - name: Generate SBOM
+      - name: Generate SBOM (CycloneDX)
         run: |
           trivy image --format cyclonedx \
-            --output sbom.json app:${{ github.sha }}
+            --output sbom.json "${IMAGE_NAME}:${GITHUB_SHA}"
 
       - name: SBOM vulnerability scan
         run: |
           trivy sbom sbom.json --format json \
             --output vuln-report.json \
-            --severity CRITICAL,HIGH
+            --severity CRITICAL,HIGH,MEDIUM,LOW
 
       - name: MITRE analysis
         run: |
           python3 scripts/mitre_analyzer.py \
             --input vuln-report.json \
             --output mitre-analysis.json \
-            --environment ${{ steps.env.outputs.environment }}
+            --environment "${ENVIRONMENT}"
 
       - name: OPA policy enforcement
         run: |
+          # Enforce environment-aware gates
           conftest test vuln-report.json \
             --policy policy/ \
             --data exceptions/ \
-            --input environment=${{ steps.env.outputs.environment }}
+            --set deny_severity="${DENY_SEVERITY}" \
+            --set allowed_severity="${ALLOWED_SEVERITY}"
 
           conftest test sbom.json --policy policy/
           conftest test mitre-analysis.json --policy policy/
+
+      - name: Compliance annotations (SLSA/NIST/ISO)
+        run: |
+          python3 scripts/compliance_mapper.py \
+            --input vuln-report.json \
+            --output compliance-report.json \
+            --frameworks SLSA,NIST800-53,ISO27001
 
       - name: Upload security artifacts
         uses: actions/upload-artifact@v3
@@ -81,3 +114,4 @@ jobs:
             vuln-report.json
             mitre-analysis.json
             trivy.sarif
+            compliance-report.json
