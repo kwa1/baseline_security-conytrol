@@ -1,0 +1,11 @@
+{
+  "exceptions": [
+    {
+      "id": "RISK-2025-001",
+      "owasp": "A06",
+      "expires": "2026-03-01",
+      "justification": "Legacy dependency pending vendor patch",
+      "approved_by": "CISO"
+    }
+  ]
+}
